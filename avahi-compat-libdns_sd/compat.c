@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <netinet/in.h>
@@ -78,9 +79,11 @@ struct _DNSServiceRef_t {
     DNSServiceDomainEnumReply domain_browser_callback;
     DNSServiceRegisterReply service_register_callback;
     DNSServiceQueryRecordReply query_resolver_callback;
+    DNSServiceGetAddrInfoReply service_getaddrinfo_callback;
 
     AvahiClient *client;
     AvahiServiceBrowser *service_browser;
+    AvahiHostNameResolver * hostname_resolver;
     AvahiServiceResolver *service_resolver;
     AvahiDomainBrowser *domain_browser;
     AvahiRecordBrowser *record_browser;
@@ -358,6 +361,30 @@ static void * thread_func(void *data) {
     return NULL;
 }
 
+static void
+avahi_address_to_sockaddr (AvahiAddress *address,
+						   AvahiIfIndex index_,
+                           struct sockaddr *sockaddr) {
+	switch (address->proto) {
+		case AVAHI_PROTO_INET:
+		{
+			struct sockaddr_in *sockaddr4 = (struct sockaddr_in *) sockaddr;
+			sockaddr4->sin_family = AF_INET;
+			sockaddr4->sin_addr.s_addr = address->data.ipv4.address;
+			break;
+		}
+		case AVAHI_PROTO_INET6:
+		{
+			struct sockaddr_in6 *sockaddr6 = (struct sockaddr_in6 *) sockaddr;
+			sockaddr6->sin6_family = AF_INET6;
+			memcpy (sockaddr6->sin6_addr.s6_addr, address->data.ipv6.address, 16);
+			sockaddr6->sin6_flowinfo = 0;
+			sockaddr6->sin6_scope_id = index_;
+			break;
+		}
+	}
+}
+
 static DNSServiceRef sdref_new(void) {
     int fd[2] = { -1, -1 };
     DNSServiceRef sdref = NULL;
@@ -375,6 +402,7 @@ static DNSServiceRef sdref_new(void) {
 
     sdref->client = NULL;
     sdref->service_browser = NULL;
+    sdref->hostname_resolver = NULL;
     sdref->service_resolver = NULL;
     sdref->domain_browser = NULL;
     sdref->entry_group = NULL;
@@ -527,6 +555,37 @@ void DNSSD_API DNSServiceRefDeallocate(DNSServiceRef sdref) {
         sdref_unref(sdref);
 }
 
+static void service_getaddrinfo_callback(AvahiHostNameResolver *r,
+										 AvahiIfIndex interface,
+    									 AVAHI_GCC_UNUSED AvahiProtocol protocol,
+									     AvahiResolverEvent event,
+									     const char *name,
+									     const AvahiAddress *address,
+									     AVAHI_GCC_UNUSED AvahiLookupResultFlags flags,
+									     void *userdata) {
+	DNSServiceRef sdref = userdata;
+	assert(r);
+	assert(sdref);
+	assert(sdref->n_ref >= 1); 
+
+
+	switch (event) {
+	
+		case AVAHI_RESOLVER_FOUND: {
+
+			struct sockaddr * sockaddr = (struct sockaddr *) malloc(sizeof(struct sockaddr_in6));
+			avahi_address_to_sockaddr ((AvahiAddress *)address, interface, sockaddr);
+	
+			sdref->service_getaddrinfo_callback(sdref, 0, interface, kDNSServiceErr_NoError, name, 	sockaddr, 0, sdref->context);	
+	        break;
+		}
+		
+		case AVAHI_RESOLVER_FAILURE:
+			fprintf(stderr, ("Failed to resolve host name '%s': %s\n"), name, avahi_strerror(avahi_client_errno(sdref->client)));
+			break; 
+	}
+}
+
 static void service_browser_callback(
     AvahiServiceBrowser *b,
     AvahiIfIndex interface,
@@ -586,7 +645,8 @@ static void generic_client_callback(AvahiClient *s, AvahiClientState state, void
                 sdref->domain_browser_callback(sdref, 0, 0, error, NULL, sdref->context);
             else if (sdref->query_resolver_callback)
                 sdref->query_resolver_callback(sdref, 0, 0, error, NULL, 0, 0, 0, NULL, 0, sdref->context);
-
+            else if (sdref->service_getaddrinfo_callback)
+				sdref->service_getaddrinfo_callback(sdref, 0, 0, error, NULL, NULL, 0, sdref->context); 
             break;
 
         case AVAHI_CLIENT_S_RUNNING:
@@ -595,6 +655,58 @@ static void generic_client_callback(AvahiClient *s, AvahiClientState state, void
         case AVAHI_CLIENT_CONNECTING:
             break;
     }
+}
+
+DNSServiceErrorType DNSSD_API DNSServiceGetAddrInfo ( 
+    DNSServiceRef *ret_sdref,
+    DNSServiceFlags flags, 
+    uint32_t interfaceIndex, 
+    DNSServiceProtocol protocol, 
+    const char *hostname, 
+    DNSServiceGetAddrInfoReply callBack, 
+    void *context) {
+
+	DNSServiceErrorType ret = kDNSServiceErr_Unknown;
+	int error;
+	DNSServiceRef sdref = NULL;
+	AvahiIfIndex ifindex;
+
+	AVAHI_WARN_LINKAGE;
+
+	if (!hostname) return kDNSServiceErr_BadParam;
+	*ret_sdref = NULL;
+
+	if (!(sdref = sdref_new())) {
+	    return kDNSServiceErr_Unknown;
+	}
+
+	sdref->context = context;
+	sdref->service_getaddrinfo_callback = callBack;
+
+	ASSERT_SUCCESS(pthread_mutex_lock(&sdref->mutex));
+
+    if (!(sdref->client = avahi_client_new(avahi_simple_poll_get(sdref->simple_poll), 0, generic_client_callback, sdref, &error))) {
+		ret =  map_error(error);
+        	goto finish;
+	}
+
+	ifindex = interfaceIndex == kDNSServiceInterfaceIndexAny ? AVAHI_IF_UNSPEC : (AvahiIfIndex) interfaceIndex;
+
+	if (!(sdref->hostname_resolver = avahi_host_name_resolver_new(sdref->client, ifindex, AVAHI_PROTO_UNSPEC, hostname, protocol, 0, service_getaddrinfo_callback, sdref))) {
+		fprintf(stderr, ("Failed to create host name resolver: %s\n"), avahi_strerror(avahi_client_errno(sdref->client))); 
+		goto finish;
+	}
+	
+	ret = kDNSServiceErr_NoError;
+	*ret_sdref = sdref;
+
+finish:
+
+	ASSERT_SUCCESS(pthread_mutex_unlock(&sdref->mutex));
+	
+	if (ret != kDNSServiceErr_NoError)
+		DNSServiceRefDeallocate(sdref);
+	return ret;
 }
 
 DNSServiceErrorType DNSSD_API DNSServiceBrowse(
