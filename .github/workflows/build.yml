@@ -1,0 +1,57 @@
+---
+name: Build test
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ${{ github.workflow }}-${{ toJSON(matrix.env) }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        env:
+          - { CC: "gcc", DISTCHECK: "true", VALGRIND: "true" }
+          - { CC: "gcc", ASAN_UBSAN: "true" }
+          - { CC: "clang", ASAN_UBSAN: "false" }
+          - { CC: "clang", ASAN_UBSAN: "true" }
+    env: ${{ matrix.env }}
+    steps:
+      - name: Repository checkout
+        uses: actions/checkout@v4
+      - run: sudo -E .github/workflows/build.sh install-build-deps
+      - run: sudo -E .github/workflows/build.sh build
+  coverage:
+    if: github.repository == 'avahi/avahi'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      checks: write
+    env:
+      CC: "gcc"
+      COVERAGE: "true"
+    steps:
+      - name: Repository checkout
+        uses: actions/checkout@v4
+      - run: sudo -E .github/workflows/build.sh install-build-deps
+      - run: sudo -E .github/workflows/build.sh build
+      - name: Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: ./coverage.info
+          format: lcov
